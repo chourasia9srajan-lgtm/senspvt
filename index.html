@@ -39,7 +39,7 @@
         .fade-in { animation: fadeIn 0.2s ease-in; }
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
         .msg-bubble { word-wrap: break-word; overflow-wrap: break-word; word-break: break-word; max-width: 100%; }
-        .chat-input { max-height: 150px; min-height: 48px; resize: none; }
+        .chat-input { max-height: 150px; min-height: 48px; resize: none; line-height: 1.5; }
     </style>
 </head>
 <body class="bg-slate-50 font-sans text-slate-900">
@@ -114,48 +114,41 @@
             const lastSelectedId = React.useRef(null);
             const remoteVideoRef = React.useRef(null);
 
-            // Safe Chat ID Generator
             const getChatId = (u1, u2) => {
                 if (!u1 || !u2) return '';
                 return [u1.toLowerCase(), u2.toLowerCase()].sort().join('_');
             };
 
             const formatTime = (ts) => {
-                if (!ts || (!ts.seconds && !ts.toDate)) return '';
-                try {
-                    const date = ts.toDate ? ts.toDate() : new Date(ts.seconds * 1000);
-                    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                } catch (e) { return ''; }
+                if (!ts) return '';
+                const date = ts.toDate ? ts.toDate() : new Date(ts.seconds * 1000);
+                if (isNaN(date.getTime())) return '';
+                return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             };
 
             const getStatusText = (targetUser) => {
                 if (!targetUser?.lastSeen) return 'Offline';
                 const lastSeenDate = targetUser.lastSeen.toDate ? targetUser.lastSeen.toDate() : new Date(targetUser.lastSeen.seconds * 1000);
-                const now = new Date();
-                const diffInSeconds = (now - lastSeenDate) / 1000;
-                return diffInSeconds < 35 ? 'Online' : `Last seen ${formatTime(targetUser.lastSeen)}`;
+                const diffInSeconds = (new Date() - lastSeenDate) / 1000;
+                return diffInSeconds < 40 ? 'Online' : `Last seen ${formatTime(targetUser.lastSeen)}`;
             };
 
-            // Keyboard Shortcuts
+            // Keyboard and UI Logic
             React.useEffect(() => {
-                const handleKeyDown = (e) => {
-                    if (e.key === 'Escape') {
-                        setSelectedUser(null);
-                        setReplyingTo(null);
-                    }
-                };
+                const handleKeyDown = (e) => { if (e.key === 'Escape') setSelectedUser(null); };
                 window.addEventListener('keydown', handleKeyDown);
                 return () => window.removeEventListener('keydown', handleKeyDown);
             }, []);
 
-            // Focus on Reply
             React.useEffect(() => {
                 if (replyingTo && inputRef.current) {
-                    setTimeout(() => inputRef.current?.focus(), 50);
+                    setTimeout(() => {
+                        inputRef.current?.focus();
+                    }, 50);
                 }
             }, [replyingTo]);
 
-            // Auth
+            // Authentication
             React.useEffect(() => {
                 signInAnonymously(auth);
                 return onAuthStateChanged(auth, (u) => {
@@ -170,56 +163,76 @@
                 });
             }, []);
 
-            // Presence (Optimized: only depends on username)
+            // Real-time Syncing
             React.useEffect(() => {
-                const username = profile?.username?.toLowerCase();
-                if (!username || !user) return;
+                if (!profile?.username || !user) return;
+                const username = profile.username.toLowerCase();
                 const updateStatus = () => { if (document.visibilityState === 'visible') updateDoc(doc(db, ...USERS_PATH, username), { lastSeen: serverTimestamp() }).catch(()=>{}); };
-                updateStatus();
                 const intv = setInterval(updateStatus, 15000);
+                updateStatus();
                 return () => clearInterval(intv);
             }, [profile?.username, user]);
 
-            // User Sync
             React.useEffect(() => {
                 if (!user || (profile?.status !== 'approved' && profile?.role !== 'admin')) return;
-                return onSnapshot(collection(db, ...USERS_PATH), (snapshot) => {
-                    const users = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
-                    setAllUsers(users);
-                    // Refresh selected user object to update live status
-                    if (selectedUser) {
-                        const fresh = users.find(u => u.username === selectedUser.username);
-                        if (fresh) setSelectedUser(fresh);
-                    }
-                });
-            }, [user, profile?.status, profile?.role]);
+                return onSnapshot(collection(db, ...USERS_PATH), (snapshot) => setAllUsers(snapshot.docs.map(d => ({ id: d.id, ...d.data() }))));
+            }, [user, profile?.status]);
 
-            // Message Sync (Optimized: depends only on current user name)
             React.useEffect(() => {
                 const myName = profile?.username?.toLowerCase();
                 if (!user || !myName) return;
                 return onSnapshot(collection(db, ...MSGS_PATH), (snap) => {
-                    const msgs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    setGlobalMessages(msgs.filter(m => m.chatId?.toLowerCase().includes(myName)));
+                    setGlobalMessages(snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(m => m.chatId?.toLowerCase().includes(myName)));
                 });
             }, [user, profile?.username]);
 
-            // Derived Messages
+            // Computed Values
             const currentMessages = React.useMemo(() => {
                 if (!selectedUser || !profile?.username) return [];
                 const chatId = getChatId(profile.username, selectedUser.username);
-                return globalMessages
-                    .filter(m => m.chatId === chatId)
-                    .sort((a,b) => (a.createdAt?.seconds||0) - (b.createdAt?.seconds||0))
-                    .slice(-100);
+                return globalMessages.filter(m => m.chatId === chatId).sort((a,b) => (a.createdAt?.seconds||0) - (b.createdAt?.seconds||0)).slice(-100);
             }, [globalMessages, selectedUser?.username, profile?.username]);
 
-            const unreadCount = React.useMemo(() => {
-                if (!selectedUser || isAtBottom) return 0;
-                return currentMessages.filter(m => m.senderName === selectedUser.username && !m.read).length;
-            }, [currentMessages, selectedUser?.username, isAtBottom]);
+            const unreadCountInSidebar = (partner) => {
+                if (!profile?.username) return 0;
+                const chatId = getChatId(profile.username, partner);
+                return globalMessages.filter(m => m.chatId === chatId && m.senderName === partner && !m.read).length;
+            };
 
-            // Scroll Handling
+            // Messaging Functions
+            const handleSend = async (e) => {
+                if (e) e.preventDefault();
+                const text = newMessage.trim();
+                if (!text || !user || !selectedUser || !profile?.username) return;
+                
+                const chatId = getChatId(profile.username, selectedUser.username);
+                setNewMessage('');
+                setReplyingTo(null);
+                if (inputRef.current) inputRef.current.style.height = 'auto';
+
+                try {
+                    const msg = { 
+                        text, 
+                        senderName: profile.username, 
+                        chatId, 
+                        displayName: profile.username, 
+                        createdAt: serverTimestamp(), 
+                        read: false 
+                    };
+                    if (replyingTo) msg.replyTo = { text: replyingTo.text, displayName: replyingTo.displayName };
+                    
+                    await addDoc(collection(db, ...MSGS_PATH), msg);
+                    updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { isTyping: false });
+                } catch (err) {
+                    console.error("Message failed", err);
+                    setNewMessage(text); // Restore text on failure
+                }
+            };
+
+            const toggleMic = () => { if (localStream) { localStream.getAudioTracks().forEach(t => t.enabled = isMuted); setIsMuted(!isMuted); } };
+            const toggleVideo = () => { if (localStream) { localStream.getVideoTracks().forEach(t => t.enabled = isVideoOff); setIsVideoOff(!isVideoOff); } };
+
+            // Scroll Logic
             React.useEffect(() => {
                 if (!selectedUser) { lastSelectedId.current = null; return; }
                 if (lastSelectedId.current !== selectedUser.username) {
@@ -229,9 +242,9 @@
                 } else if (isAtBottom) {
                     scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
                 }
-            }, [currentMessages, selectedUser?.username]);
+            }, [currentMessages, selectedUser]);
 
-            // Read Status Handler
+            // Read Status Logic
             React.useEffect(() => {
                 if (!user || !selectedUser || currentMessages.length === 0 || !profile?.username) return;
                 if (document.visibilityState === 'visible' && document.hasFocus() && isAtBottom) {
@@ -240,33 +253,6 @@
                     });
                 }
             }, [currentMessages, selectedUser?.username, isAtBottom, profile?.username]);
-
-            const handleSend = async (e) => {
-                if (e) e.preventDefault();
-                if (!newMessage.trim() || !user || !selectedUser) return;
-                const text = newMessage; setNewMessage(''); setReplyingTo(null);
-                if (inputRef.current) inputRef.current.style.height = 'auto';
-                const msg = { text, senderName: profile.username, chatId: getChatId(profile.username, selectedUser.username), displayName: profile.username, createdAt: serverTimestamp(), read: false };
-                if (replyingTo) msg.replyTo = { text: replyingTo.text, displayName: replyingTo.displayName };
-                await addDoc(collection(db, ...MSGS_PATH), msg);
-                updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { isTyping: false });
-            };
-
-            const startCall = async () => {
-                setIsCalling(true);
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                setLocalStream(stream);
-                pc.current = new RTCPeerConnection({ iceServers: [{ urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }] });
-                stream.getTracks().forEach(t => pc.current.addTrack(t, stream));
-                pc.current.ontrack = (e) => setRemoteStream(e.streams[0]);
-                const callDoc = doc(collection(db, ...CALLS_PATH));
-                pc.current.onicecandidate = (e) => e.candidate && addDoc(collection(db, ...CALLS_PATH, callDoc.id, 'candidates'), e.candidate.toJSON());
-                const offer = await pc.current.createOffer();
-                await pc.current.setLocalDescription(offer);
-                await setDoc(callDoc, { caller: profile.username, target: selectedUser.username, offer: { sdp: offer.sdp, type: offer.type }, status: 'offered' });
-                onSnapshot(callDoc, (snap) => snap.data()?.answer && pc.current.setRemoteDescription(new RTCSessionDescription(snap.data().answer)));
-                onSnapshot(collection(db, ...CALLS_PATH, callDoc.id, 'candidates'), (s) => s.docChanges().forEach(c => c.type === 'added' && pc.current.addIceCandidate(new RTCIceCandidate(c.doc.data()))));
-            };
 
             if (loading) return <div className="h-screen flex items-center justify-center bg-slate-50"><div className="animate-spin h-8 w-8 border-4 border-indigo-600 border-t-transparent rounded-full"></div></div>;
 
@@ -282,37 +268,38 @@
                             const uDoc = await getDoc(uRef);
                             if (uDoc.exists()) {
                                 if (uDoc.data().password === passwordInput) await updateDoc(uRef, { uid: user.uid, lastSeen: serverTimestamp() });
-                                else setAuthError('Invalid Key');
-                            } else await setDoc(uRef, { username: usernameInput.trim(), password: passwordInput, status: 'pending', createdAt: serverTimestamp(), role: 'member', uid: user.uid, lastSeen: serverTimestamp() });
+                                else setAuthError('Invalid Access Key');
+                            } else {
+                                await setDoc(uRef, { username: usernameInput.trim(), password: passwordInput, status: 'pending', createdAt: serverTimestamp(), role: 'member', uid: user.uid, isTyping: false, lastSeen: serverTimestamp() });
+                            }
                             setLoading(false);
                         }} className="space-y-4 text-left">
                             <input className="w-full border p-4 rounded-xl outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Username" value={usernameInput} onChange={e => setUsernameInput(e.target.value)} required />
                             <input type="password" className="w-full border p-4 rounded-xl outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Access Key" value={passwordInput} onChange={e => setPasswordInput(e.target.value)} required />
                             {authError && <p className="text-red-500 text-xs font-bold">{authError}</p>}
-                            <button className="w-full bg-indigo-600 text-white font-bold py-4 rounded-xl">Connect</button>
+                            <button className="w-full bg-indigo-600 text-white font-bold py-4 rounded-xl">Initialize</button>
                         </form>
                     </div>
                 </div>
             );
 
-            if (profile?.status === 'pending') return <div className="h-screen flex items-center justify-center p-4 text-center"><div className="max-w-xs"><Icon name="clock" size={48} className="mx-auto mb-4 text-amber-500 animate-pulse" /><h2 className="text-xl font-bold uppercase tracking-widest">Authorized Access Pending</h2><p className="text-slate-500 text-xs mt-2 uppercase">Admin verification required for @{profile.username}</p></div></div>;
+            if (profile?.status === 'pending') return <div className="h-screen flex items-center justify-center p-4 text-center bg-slate-50"><div className="max-w-xs"><Icon name="clock" size={48} className="mx-auto mb-4 text-amber-500 animate-pulse" /><h2 className="text-xl font-bold uppercase tracking-widest">Auth Pending</h2><p className="text-slate-500 text-xs mt-2">Waiting for admin approval for @{profile.username}</p></div></div>;
 
             return (
                 <div className="flex h-screen w-full max-w-6xl mx-auto bg-white relative overflow-hidden md:flex-row border-x border-slate-100">
                     {/* Sidebar */}
                     <div className={`w-full md:w-80 border-r bg-slate-50 flex flex-col shrink-0 h-full ${selectedUser ? 'hidden md:flex' : 'flex'}`}>
-                        <header className="p-5 bg-indigo-900 text-white flex items-center justify-between shrink-0 h-16 shadow-lg z-20">
-                            <div className="flex items-center gap-2"><Icon name="message-square" className="text-indigo-300" /><h2 className="font-bold text-sm tracking-widest uppercase">Secure Vault</h2></div>
+                        <header className="p-4 md:p-5 bg-indigo-900 text-white flex items-center justify-between shrink-0 h-16 shadow-lg z-20">
+                            <div className="flex items-center gap-2"><Icon name="message-square" className="text-indigo-300" /><h2 className="font-bold text-sm tracking-widest uppercase">Secure</h2></div>
                             <button onClick={() => updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { uid: null }).then(() => window.location.reload())}><Icon name="log-out" size={18} /></button>
                         </header>
                         <div className="flex-1 overflow-y-auto hide-scrollbar">
-                            <div className="px-3 py-4 text-[10px] font-black uppercase text-slate-400 tracking-widest">Authorized Rooms</div>
+                            <div className="px-3 py-4 text-[10px] font-black uppercase text-slate-400 tracking-widest">Active Channels</div>
                             {allUsers.filter(u => u.status === 'approved' && (profile.role === 'admin' ? u.role !== 'admin' : u.role === 'admin')).map(u => {
-                                if (!profile?.username) return null;
                                 const chatId = getChatId(profile.username, u.username);
                                 const chatHistory = globalMessages.filter(m => m.chatId === chatId);
                                 const lastM = chatHistory.sort((a,b) => (b.createdAt?.seconds||0) - (a.createdAt?.seconds||0))[0];
-                                const unread = chatHistory.filter(m => m.senderName === u.username && !m.read).length;
+                                const unread = unreadCountInSidebar(u.username);
                                 return (
                                     <button key={u.id} onClick={() => setSelectedUser(u)} className={`w-full text-left p-4 transition-all flex items-center gap-3 border-b ${selectedUser?.username === u.username ? 'bg-indigo-600 text-white shadow-xl' : 'bg-white hover:bg-slate-50'}`}>
                                         <div className="relative shrink-0">
@@ -352,14 +339,13 @@
                                         </div>
                                     </div>
                                     <div className="flex gap-2">
-                                        <button onClick={startCall} className="p-2 text-indigo-600 hover:bg-indigo-50 rounded-xl"><Icon name="video" size={20} /></button>
-                                        <button onClick={() => {
+                                        <button title="Video Call" className="p-2 text-indigo-600 hover:bg-indigo-50 rounded-xl"><Icon name="video" size={20} /></button>
+                                        <button onClick={async () => {
                                             const chatId = getChatId(profile.username, selectedUser.username);
-                                            getDocs(collection(db, ...MSGS_PATH)).then(snap => {
-                                                const batch = writeBatch(db);
-                                                snap.forEach(d => { if(d.data().chatId === chatId) batch.delete(d.ref); });
-                                                batch.commit();
-                                            });
+                                            const snap = await getDocs(collection(db, ...MSGS_PATH));
+                                            const batch = writeBatch(db);
+                                            snap.forEach(d => { if(d.data().chatId === chatId) batch.delete(d.ref); });
+                                            await batch.commit();
                                         }} className="p-2 text-slate-300 hover:text-red-500"><Icon name="trash-2" size={20} /></button>
                                     </div>
                                 </header>
@@ -392,48 +378,23 @@
                                     {replyingTo && (
                                         <div className="mb-3 p-3 bg-indigo-50 border-l-4 border-indigo-600 rounded-xl flex items-center justify-between shadow-inner">
                                             <div className="flex-1 truncate pr-4 text-[10px] font-bold text-slate-600"><span className="text-indigo-600 block text-[9px] mb-0.5 uppercase font-black">Replying to {replyingTo.displayName}</span>{replyingTo.text}</div>
-                                            <button onClick={() => setReplyingTo(null)}><Icon name="x" size={16} /></button>
+                                            <button onClick={() => setReplyingTo(null)} className="p-1"><Icon name="x" size={16} /></button>
                                         </div>
                                     )}
                                     <form onSubmit={handleSend} className="flex gap-2 w-full items-end">
                                         <button type="button" className="p-3 shrink-0 text-slate-400"><Icon name="smile" size={24} /></button>
-                                        <textarea ref={inputRef} value={newMessage} onKeyDown={(e) => { if(e.key==='Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }} onChange={(e) => { setNewMessage(e.target.value); e.target.style.height = 'auto'; e.target.style.height = `${e.target.scrollHeight}px`; updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { isTyping: e.target.value.length > 0 }); }} className="flex-1 bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 outline-none focus:ring-4 focus:ring-indigo-500/10 text-base min-w-0 chat-input overflow-y-auto hide-scrollbar" placeholder="Message..." rows="1" />
-                                        <button type="submit" disabled={!newMessage.trim()} className="bg-indigo-600 text-white p-3 md:p-4 rounded-2xl shadow-xl hover:bg-indigo-700 active:scale-90 disabled:opacity-50 shrink-0 transition-all mb-1"><Icon name="send" size={20} /></button>
+                                        <textarea ref={inputRef} value={newMessage} onFocus={() => setReplyingTo(null)} onKeyDown={(e) => { if(e.key==='Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }} onChange={handleInputChange} className="flex-1 bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 outline-none focus:ring-4 focus:ring-indigo-500/10 text-base min-w-0 chat-input overflow-y-auto hide-scrollbar" placeholder="Message..." rows="1" />
+                                        <button type="submit" disabled={!newMessage.trim()} className="bg-indigo-600 text-white p-3 md:p-4 rounded-2xl shadow-xl hover:bg-indigo-700 active:scale-90 disabled:opacity-50 shrink-0 mb-1"><Icon name="send" size={20} /></button>
                                     </form>
                                 </footer>
                             </>
                         ) : (
                             <div className="flex-1 flex flex-col items-center justify-center text-slate-300 p-8 text-center uppercase tracking-[0.25em] font-black">
                                 <div className="bg-slate-50 p-10 rounded-[3rem] border border-slate-100 mb-8"><Icon name="message-square" size={64} className="opacity-10" /></div>
-                                <p className="text-[10px]">Secure Vault established</p>
+                                <p className="text-[10px]">Vault Secured</p>
                             </div>
                         )}
                     </div>
-
-                    {/* Incoming Call Overlay */}
-                    {incomingCall && (
-                        <div className="fixed inset-0 z-[200] bg-black/90 backdrop-blur flex flex-col items-center justify-center text-white text-center">
-                            <div className="w-24 h-24 bg-white/10 rounded-full flex items-center justify-center text-3xl font-bold uppercase mb-6 animate-bounce border-2 border-white/20">{incomingCall.caller[0]}</div>
-                            <h3 className="text-2xl font-bold mb-8 uppercase tracking-tighter">@{incomingCall.caller} calling...</h3>
-                            <div className="flex gap-6">
-                                <button onClick={async () => {
-                                    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                                    setLocalStream(stream); setIsCalling(true);
-                                    pc.current = new RTCPeerConnection({ iceServers: [{ urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }] });
-                                    stream.getTracks().forEach(t => pc.current.addTrack(t, stream));
-                                    pc.current.ontrack = (e) => setRemoteStream(e.streams[0]);
-                                    pc.current.onicecandidate = (e) => e.candidate && addDoc(collection(db, ...CALLS_PATH, incomingCall.id, 'candidates'), e.candidate.toJSON());
-                                    await pc.current.setRemoteDescription(new RTCSessionDescription(incomingCall.offer));
-                                    const answer = await pc.current.createAnswer();
-                                    await pc.current.setLocalDescription(answer);
-                                    await updateDoc(doc(db, ...CALLS_PATH, incomingCall.id), { answer: { sdp: answer.sdp, type: answer.type }, status: 'answered' });
-                                    onSnapshot(collection(db, ...CALLS_PATH, incomingCall.id, 'candidates'), (s) => s.docChanges().forEach(c => c.type === 'added' && pc.current.addIceCandidate(new RTCIceCandidate(c.doc.data()))));
-                                    setIncomingCall(null);
-                                }} className="bg-green-500 w-16 h-16 rounded-full flex items-center justify-center shadow-lg"><Icon name="phone" size={28} /></button>
-                                <button onClick={() => { updateDoc(doc(db, ...CALLS_PATH, incomingCall.id), { status: 'ended' }); setIncomingCall(null); }} className="bg-red-500 w-16 h-16 rounded-full flex items-center justify-center shadow-lg"><Icon name="phone-off" size={28} /></button>
-                            </div>
-                        </div>
-                    )}
                 </div>
             );
         }
