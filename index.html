@@ -35,7 +35,6 @@
             30% { transform: translateY(-4px); opacity: 1; }
         }
         
-        /* Reply Button Styling */
         .message-group .reply-button { opacity: 0; transition: opacity 0.2s; }
         .message-group:hover .reply-button { opacity: 1; }
         @media (max-width: 768px) { .message-group .reply-button { opacity: 1; } }
@@ -114,7 +113,7 @@
         function App() {
             const [user, setUser] = React.useState(null);
             const [profile, setProfile] = React.useState(null);
-            const [messages, setMessages] = React.useState([]);
+            const [globalMessages, setGlobalMessages] = React.useState([]); 
             const [allUsers, setAllUsers] = React.useState([]);
             const [selectedUser, setSelectedUser] = React.useState(null);
             const [usernameInput, setUsernameInput] = React.useState('');
@@ -127,7 +126,6 @@
             const [isClearing, setIsClearing] = React.useState(false);
             const [showEmojiPicker, setShowEmojiPicker] = React.useState(false);
             
-            // Video Call States
             const [isCalling, setIsCalling] = React.useState(false);
             const [incomingCall, setIncomingCall] = React.useState(null);
             const [localStream, setLocalStream] = React.useState(null);
@@ -141,10 +139,27 @@
 
             const getChatId = (u1, u2) => [u1.toLowerCase(), u2.toLowerCase()].sort().join('_');
 
+            // Timestamp formatting helper
+            const formatTime = (ts) => {
+                if (!ts) return '';
+                const date = ts.toDate ? ts.toDate() : new Date(ts.seconds * 1000);
+                return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            };
+
+            // Presence formatting helper
+            const getStatusText = (targetUser) => {
+                if (!targetUser?.lastSeen) return 'Offline';
+                const lastSeenDate = targetUser.lastSeen.toDate ? targetUser.lastSeen.toDate() : new Date(targetUser.lastSeen.seconds * 1000);
+                const now = new Date();
+                const diffInSeconds = (now - lastSeenDate) / 1000;
+                
+                if (diffInSeconds < 60) return 'Online';
+                return `Last seen ${formatTime(targetUser.lastSeen)}`;
+            };
+
             // --- AUTO FOCUS ON REPLY ---
             React.useEffect(() => {
                 if (replyingTo && inputRef.current) {
-                    // Small timeout ensures the focus works on mobile browsers after layout shifts
                     setTimeout(() => {
                         inputRef.current?.focus();
                     }, 100);
@@ -174,7 +189,31 @@
                 });
             }, []);
 
-            // 2. Call Listener
+            // 2. Presence Heartbeat
+            React.useEffect(() => {
+                if (!profile?.username || !user) return;
+
+                const updatePresence = async () => {
+                    if (document.visibilityState === 'visible') {
+                        try {
+                            await updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), {
+                                lastSeen: serverTimestamp()
+                            });
+                        } catch (e) { console.error("Presence update failed", e); }
+                    }
+                };
+
+                updatePresence(); // Initial
+                const interval = setInterval(updatePresence, 30000); // Every 30s
+                document.addEventListener('visibilitychange', updatePresence);
+
+                return () => {
+                    clearInterval(interval);
+                    document.removeEventListener('visibilitychange', updatePresence);
+                };
+            }, [profile?.username, user]);
+
+            // 3. Call Listener
             React.useEffect(() => {
                 if (!profile?.username || !user) return;
                 const callsRef = collection(db, ...CALLS_PATH);
@@ -191,7 +230,17 @@
                 });
             }, [profile, user]);
 
-            // 3. User & Message Sync
+            // 4. Global Message Sync (For Unread Counts)
+            React.useEffect(() => {
+                if (!user || !profile?.username) return;
+                return onSnapshot(collection(db, ...MSGS_PATH), (snapshot) => {
+                    const all = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    const filtered = all.filter(m => m.chatId && m.chatId.toLowerCase().includes(profile.username.toLowerCase()));
+                    setGlobalMessages(filtered);
+                });
+            }, [user, profile?.username]);
+
+            // 5. User Sync
             React.useEffect(() => {
                 if (!user || (profile?.status !== 'approved' && profile?.role !== 'admin')) return;
                 return onSnapshot(collection(db, ...USERS_PATH), (snapshot) => {
@@ -199,24 +248,22 @@
                 });
             }, [user, profile]);
 
-            React.useEffect(() => {
-                if (!user || !selectedUser || !profile?.username) return;
+            const currentMessages = React.useMemo(() => {
+                if (!selectedUser || !profile?.username) return [];
                 const currentChatId = getChatId(profile.username, selectedUser.username);
-                return onSnapshot(collection(db, ...MSGS_PATH), (snapshot) => {
-                    const all = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    const filtered = all.filter(m => m.chatId === currentChatId);
-                    setMessages(filtered.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0)).slice(-100));
-                });
-            }, [user, profile, selectedUser?.username]);
+                return globalMessages
+                    .filter(m => m.chatId === currentChatId)
+                    .sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0))
+                    .slice(-100);
+            }, [globalMessages, selectedUser, profile?.username]);
 
-            // 4. Read Status Updates (IMPROVED: Only if tab is focused)
+            // 6. Read Status Logic
             React.useEffect(() => {
-                if (!user || !selectedUser || messages.length === 0 || !profile?.username) return;
+                if (!user || !selectedUser || currentMessages.length === 0 || !profile?.username) return;
                 
                 const markAsRead = async () => {
-                    // Only mark as read if the user is actually viewing the tab
-                    if (document.visibilityState === 'visible' && document.hasFocus()) {
-                        const unread = messages.filter(m => m.senderName === selectedUser.username && !m.read);
+                    if (document.visibilityState === 'visible' && document.hasFocus() && selectedUser) {
+                        const unread = currentMessages.filter(m => m.senderName === selectedUser.username && !m.read);
                         unread.forEach(async (m) => {
                             try { await updateDoc(doc(db, ...MSGS_PATH, m.id), { read: true }); } catch (e) {}
                         });
@@ -230,29 +277,25 @@
                     window.removeEventListener('focus', markAsRead);
                     document.removeEventListener('visibilitychange', markAsRead);
                 };
-            }, [messages, selectedUser, profile]);
+            }, [currentMessages, selectedUser, profile]);
 
-            // 5. Scroll Logic
-            React.useEffect(() => { scrollRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, selectedUser]);
+            // 7. Scroll Logic
+            React.useEffect(() => { scrollRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [currentMessages, selectedUser]);
 
-            // --- VIDEO CALL LOGIC ---
+            // Video Call Controls
             const startCall = async () => {
                 if (!selectedUser || !user) return;
                 try {
-                    setIsCalling(true);
-                    setIsMuted(false);
-                    setIsVideoOff(false);
+                    setIsCalling(true); setIsMuted(false); setIsVideoOff(false);
                     const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
                     setLocalStream(stream);
                     pc.current = new RTCPeerConnection({ iceServers: [{ urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }] });
                     stream.getTracks().forEach(track => pc.current.addTrack(track, stream));
                     pc.current.ontrack = (e) => setRemoteStream(e.streams[0]);
-
                     const callDoc = doc(collection(db, ...CALLS_PATH));
                     pc.current.onicecandidate = (e) => {
                         if (e.candidate) addDoc(collection(db, ...CALLS_PATH, callDoc.id, 'candidates'), e.candidate.toJSON());
                     };
-
                     const offer = await pc.current.createOffer();
                     await pc.current.setLocalDescription(offer);
                     await setDoc(callDoc, { caller: profile.username, target: selectedUser.username, offer: { sdp: offer.sdp, type: offer.type }, status: 'offered' });
@@ -319,7 +362,7 @@
                 setLocalStream(null); setRemoteStream(null); setIsCalling(false); setIncomingCall(null);
             };
 
-            // --- HANDLERS ---
+            // Handlers
             const handleLogin = async (e) => {
                 e.preventDefault();
                 const cleanU = usernameInput.trim().toLowerCase();
@@ -329,9 +372,9 @@
                     const userRef = doc(db, ...USERS_PATH, cleanU);
                     const userDoc = await getDoc(userRef);
                     if (userDoc.exists()) {
-                        if (userDoc.data().password === pass) await updateDoc(userRef, { uid: user.uid });
+                        if (userDoc.data().password === pass) await updateDoc(userRef, { uid: user.uid, lastSeen: serverTimestamp() });
                         else setAuthError('Incorrect password.');
-                    } else await setDoc(userRef, { username: usernameInput.trim(), password: pass, status: 'pending', createdAt: serverTimestamp(), role: 'member', uid: user.uid, isTyping: false });
+                    } else await setDoc(userRef, { username: usernameInput.trim(), password: pass, status: 'pending', createdAt: serverTimestamp(), role: 'member', uid: user.uid, isTyping: false, lastSeen: serverTimestamp() });
                 } catch (err) { setAuthError('Connection error.'); }
                 setLoading(false);
             };
@@ -353,6 +396,12 @@
                 if (inputRef.current) inputRef.current.focus();
             };
 
+            const getUnreadCount = (partnerUsername) => {
+                if (!profile?.username) return 0;
+                const chatId = getChatId(profile.username, partnerUsername);
+                return globalMessages.filter(m => m.chatId === chatId && m.senderName === partnerUsername && !m.read).length;
+            };
+
             if (loading) return <div className="h-screen flex items-center justify-center text-indigo-600"><div className="animate-spin h-8 w-8 border-4 border-indigo-600 border-t-transparent rounded-full"></div></div>;
 
             if (!user || profile?.status === 'new') return (
@@ -361,8 +410,8 @@
                         <Icon name="shield-check" size={48} className="mx-auto mb-4 text-indigo-600" />
                         <h2 className="text-2xl font-bold mb-6">Sens Chat</h2>
                         <form onSubmit={handleLogin} className="space-y-4 text-left">
-                            <input className="w-full bg-slate-50 border p-4 rounded-xl outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Username" value={usernameInput} onChange={e => setUsernameInput(e.target.value)} required />
-                            <input type="password" className="w-full bg-slate-50 border p-4 rounded-xl outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Password" value={passwordInput} onChange={e => setPasswordInput(e.target.value)} required />
+                            <input className="w-full bg-slate-50 border p-4 rounded-xl outline-none focus:ring-2 focus:ring-indigo-500 text-base" placeholder="Username" value={usernameInput} onChange={e => setUsernameInput(e.target.value)} required />
+                            <input type="password" className="w-full bg-slate-50 border p-4 rounded-xl outline-none focus:ring-2 focus:ring-indigo-500 text-base" placeholder="Password" value={passwordInput} onChange={e => setPasswordInput(e.target.value)} required />
                             {authError && <p className="text-red-500 text-xs font-bold">{authError}</p>}
                             <button className="w-full bg-indigo-600 text-white font-bold py-4 rounded-xl">Connect</button>
                         </form>
@@ -370,18 +419,16 @@
                 </div>
             );
 
-            if (profile?.status === 'pending') return <div className="h-full flex items-center justify-center p-4 text-center"><div className="max-w-xs"><Icon name="clock" size={48} className="mx-auto mb-4 text-amber-500 animate-pulse" /><h2 className="text-xl font-bold">Access Pending</h2><p className="text-slate-500 text-sm mt-2">Wait for admin to verify @{profile.username}.</p><button onClick={() => updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { uid: null })} className="mt-6 text-xs font-black uppercase text-indigo-600">Switch User</button></div></div>;
+            if (profile?.status === 'pending') return <div className="h-full flex items-center justify-center p-4 text-center"><div className="max-w-xs"><Icon name="clock" size={48} className="mx-auto mb-4 text-amber-500 animate-pulse" /><h2 className="text-xl font-bold">Access Pending</h2><p className="text-slate-500 text-sm mt-2 font-medium">Wait for admin to verify @{profile.username}.</p><button onClick={() => updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { uid: null })} className="mt-6 text-xs font-black uppercase text-indigo-600">Switch User</button></div></div>;
 
             return (
                 <div className="flex h-full w-full max-w-6xl mx-auto bg-white relative overflow-hidden md:flex-row border-x border-slate-100">
-                    {/* Video Call UI */}
+                    {/* Video Call UI Overlay */}
                     {(isCalling || incomingCall) && (
                         <div className="fixed inset-0 z-[100] bg-black flex flex-col items-center justify-center overflow-hidden">
                             {incomingCall ? (
                                 <div className="text-white text-center animate-in fade-in flex flex-col items-center">
-                                    <div className="w-24 h-24 bg-white/10 rounded-full flex items-center justify-center text-3xl font-bold uppercase mb-6 animate-bounce border-2 border-white/20">
-                                        {incomingCall.caller[0]}
-                                    </div>
+                                    <div className="w-24 h-24 bg-white/10 rounded-full flex items-center justify-center text-3xl font-bold uppercase mb-6 animate-bounce border-2 border-white/20">{incomingCall.caller[0]}</div>
                                     <h3 className="text-2xl font-bold mb-8 uppercase tracking-tighter">@{incomingCall.caller} is calling...</h3>
                                     <div className="flex gap-6">
                                         <button onClick={acceptCall} className="bg-green-500 w-16 h-16 rounded-full flex items-center justify-center shadow-lg"><Icon name="phone" size={28} /></button>
@@ -394,32 +441,18 @@
                                         <video autoPlay playsInline className="w-full h-full object-cover" ref={v => { if(v) v.srcObject = remoteStream; }} />
                                     ) : (
                                         <div className="text-white text-center flex flex-col items-center animate-pulse">
-                                            <div className="w-32 h-32 rounded-full bg-white/10 flex items-center justify-center text-5xl font-bold uppercase mb-6 border-4 border-white/20 shadow-2xl">
-                                                {selectedUser?.username[0]}
-                                            </div>
+                                            <div className="w-32 h-32 rounded-full bg-white/10 flex items-center justify-center text-5xl font-bold uppercase mb-6 border-4 border-white/20 shadow-2xl">{selectedUser?.username[0]}</div>
                                             <h3 className="text-2xl font-black uppercase tracking-[0.2em]">Calling @{selectedUser?.username}...</h3>
                                             <p className="text-indigo-300 text-[10px] font-black uppercase mt-4 tracking-widest">Waiting for response</p>
                                         </div>
                                     )}
-                                    
                                     <div className="absolute top-4 right-4 w-24 h-36 md:w-40 md:h-56 bg-slate-800 rounded-2xl border-2 border-white/20 overflow-hidden shadow-2xl z-20">
-                                        {!isVideoOff ? (
-                                            <video id="localVideo" autoPlay muted playsInline className="w-full h-full object-cover" ref={v => { if(v) v.srcObject = localStream; }} />
-                                        ) : (
-                                            <div className="w-full h-full flex items-center justify-center bg-slate-700 text-slate-500"><Icon name="video-off" size={24} /></div>
-                                        )}
+                                        {!isVideoOff ? <video id="localVideo" autoPlay muted playsInline className="w-full h-full object-cover" ref={v => { if(v) v.srcObject = localStream; }} /> : <div className="w-full h-full flex items-center justify-center bg-slate-700 text-slate-500"><Icon name="video-off" size={24} /></div>}
                                     </div>
-
                                     <div className="absolute bottom-10 left-0 right-0 flex justify-center items-center gap-6 z-30">
-                                        <button onClick={toggleMic} className={`w-14 h-14 rounded-full flex items-center justify-center border-2 border-white/20 transition-all ${isMuted ? 'bg-red-500 text-white' : 'bg-white/10 text-white'}`}>
-                                            <Icon name={isMuted ? "mic-off" : "mic"} size={24} />
-                                        </button>
-                                        <button onClick={endCall} className="w-16 h-16 bg-red-600 rounded-full flex items-center justify-center text-white shadow-[0_0_30px_rgba(239,68,68,0.4)] active:scale-90 transition-all">
-                                            <Icon name="phone-off" size={28} />
-                                        </button>
-                                        <button onClick={toggleVideo} className={`w-14 h-14 rounded-full flex items-center justify-center border-2 border-white/20 transition-all ${isVideoOff ? 'bg-red-500 text-white' : 'bg-white/10 text-white'}`}>
-                                            <Icon name={isVideoOff ? "video-off" : "video"} size={24} />
-                                        </button>
+                                        <button onClick={toggleMic} className={`w-14 h-14 rounded-full flex items-center justify-center border-2 border-white/20 transition-all ${isMuted ? 'bg-red-500 text-white' : 'bg-white/10 text-white'}`}><Icon name={isMuted ? "mic-off" : "mic"} size={24} /></button>
+                                        <button onClick={endCall} className="w-16 h-16 bg-red-600 rounded-full flex items-center justify-center text-white shadow-[0_0_30px_rgba(239,68,68,0.4)] active:scale-90 transition-all"><Icon name="phone-off" size={28} /></button>
+                                        <button onClick={toggleVideo} className={`w-14 h-14 rounded-full flex items-center justify-center border-2 border-white/20 transition-all ${isVideoOff ? 'bg-red-500 text-white' : 'bg-white/10 text-white'}`}><Icon name={isVideoOff ? "video-off" : "video"} size={24} /></button>
                                     </div>
                                 </div>
                             )}
@@ -437,12 +470,27 @@
                                 <div key={u.username} className="p-3 bg-white border rounded-xl mb-2 animate-in slide-in-from-left-2"><p className="font-bold text-sm mb-2 uppercase tracking-tight">@{u.username}</p><div className="flex gap-2"><button onClick={() => updateDoc(doc(db, ...USERS_PATH, u.username.toLowerCase()), {status:'approved'})} className="flex-1 bg-indigo-600 text-white py-2 rounded-lg text-[10px] font-bold uppercase">Approve</button></div></div>
                             ))}
                             <div className="px-3 py-2 text-[10px] font-black uppercase text-slate-400 mt-2 tracking-widest">Active Channels</div>
-                            {allUsers.filter(u => u.status === 'approved' && (profile.role === 'admin' ? u.role !== 'admin' : u.role === 'admin')).map(u => (
-                                <button key={u.username} onClick={() => setSelectedUser(u)} className={`w-full text-left p-4 rounded-2xl mb-1 flex items-center justify-between group transition-all ${selectedUser?.username === u.username ? 'bg-indigo-600 text-white shadow-xl translate-x-1' : 'hover:bg-indigo-50'}`}>
-                                    <div className="flex items-center gap-3"><div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold uppercase shadow-sm ${selectedUser?.username === u.username ? 'bg-indigo-500' : 'bg-indigo-100 text-indigo-600'}`}>{u.username[0]}</div><span className="font-bold text-sm uppercase tracking-tight">@{u.username}</span></div>
-                                    {u.isTyping && <span className="text-[9px] font-bold animate-pulse uppercase tracking-tighter">typing...</span>}
-                                </button>
-                            ))}
+                            {allUsers.filter(u => u.status === 'approved' && (profile.role === 'admin' ? u.role !== 'admin' : u.role === 'admin')).map(u => {
+                                const unreadCount = getUnreadCount(u.username);
+                                const status = getStatusText(u);
+                                return (
+                                    <button key={u.username} onClick={() => setSelectedUser(u)} className={`w-full text-left p-4 rounded-2xl mb-1 flex items-center justify-between group transition-all ${selectedUser?.username === u.username ? 'bg-indigo-600 text-white shadow-xl translate-x-1' : 'hover:bg-indigo-50'}`}>
+                                        <div className="flex items-center gap-3 min-w-0">
+                                            <div className="relative shrink-0">
+                                                <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold uppercase shadow-sm ${selectedUser?.username === u.username ? 'bg-indigo-500' : 'bg-indigo-100 text-indigo-600'}`}>{u.username[0]}</div>
+                                                {status === 'Online' && <div className="absolute bottom-0 right-0 w-3 h-3 bg-green-500 border-2 border-white rounded-full"></div>}
+                                            </div>
+                                            <div className="flex flex-col min-w-0">
+                                                <span className="font-bold text-sm uppercase tracking-tight truncate">@{u.username}</span>
+                                                <span className={`text-[9px] font-bold uppercase tracking-tighter ${selectedUser?.username === u.username ? 'text-indigo-200' : 'text-slate-400'}`}>
+                                                    {u.isTyping ? <span className="animate-pulse">typing...</span> : status}
+                                                </span>
+                                            </div>
+                                        </div>
+                                        {unreadCount > 0 && selectedUser?.username !== u.username && <div className="bg-indigo-600 text-white text-[10px] font-black px-2 py-1 rounded-full min-w-[20px] text-center shadow-lg animate-bounce shrink-0 ml-2">{unreadCount}</div>}
+                                    </button>
+                                );
+                            })}
                         </div>
                     </div>
 
@@ -452,9 +500,17 @@
                             <div className="flex flex-col h-full fade-in min-w-0">
                                 <header className="p-3 md:p-4 border-b flex justify-between items-center bg-white shrink-0 h-16 z-10">
                                     <div className="flex items-center gap-2 min-w-0">
-                                        <button onClick={() => setSelectedUser(null)} className="md:hidden p-2"><Icon name="chevron-left" size={24} /></button>
+                                        <button onClick={() => setSelectedUser(null)} className="md:hidden p-2 -ml-2 text-slate-400"><Icon name="chevron-left" size={24} /></button>
                                         <div className="w-9 h-9 md:w-10 md:h-10 rounded-full bg-slate-50 border flex items-center justify-center font-bold uppercase shrink-0 text-indigo-600">{(selectedUser.username || 'U')[0]}</div>
-                                        <div className="flex flex-col min-w-0"><h2 className="font-bold uppercase text-sm tracking-tighter truncate">@{selectedUser.username}</h2><div className="flex items-center gap-1"><div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></div><span className="text-[9px] font-bold text-indigo-600 uppercase tracking-widest">Secure</span></div></div>
+                                        <div className="flex flex-col min-w-0">
+                                            <h2 className="font-bold uppercase text-sm tracking-tighter truncate">@{selectedUser.username}</h2>
+                                            <div className="flex items-center gap-1">
+                                                <div className={`w-1.5 h-1.5 rounded-full ${getStatusText(selectedUser) === 'Online' ? 'bg-green-500 animate-pulse' : 'bg-slate-300'}`}></div>
+                                                <span className="text-[9px] font-bold text-indigo-600 uppercase tracking-widest">
+                                                    {getStatusText(selectedUser)}
+                                                </span>
+                                            </div>
+                                        </div>
                                     </div>
                                     <div className="flex gap-1">
                                         <button onClick={startCall} className="p-2.5 text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"><Icon name="video" size={20} /></button>
@@ -463,35 +519,25 @@
                                 </header>
 
                                 <main className="flex-1 overflow-y-auto p-4 space-y-5 bg-slate-50/30 hide-scrollbar relative">
-                                    {messages.map(m => {
+                                    {currentMessages.map(m => {
                                         const isMine = m.senderName === profile.username;
                                         return (
                                             <div key={m.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'} group items-center gap-2 max-w-full message-group`}>
-                                                {/* Reply button positioned correctly for sender and receiver */}
-                                                <button 
-                                                    onClick={() => setReplyingTo(m)} 
-                                                    className={`reply-button p-2 text-slate-400 bg-white border border-slate-100 rounded-full shadow-sm shrink-0 active:scale-90 ${isMine ? 'order-first' : 'order-last'}`}
-                                                >
-                                                    <Icon name="corner-up-left" size={12} />
-                                                </button>
-                                                
+                                                <button onClick={() => setReplyingTo(m)} className={`reply-button p-2 text-slate-400 bg-white border border-slate-100 rounded-full shadow-sm shrink-0 active:scale-90 ${isMine ? 'order-first' : 'order-last'}`}><Icon name="corner-up-left" size={12} /></button>
                                                 <div className={`flex flex-col min-w-0 ${isMine ? 'items-end' : 'items-start'} max-w-[85%] md:max-w-[75%]`}>
                                                     <div className={`p-4 rounded-2xl text-[14px] leading-relaxed shadow-sm relative msg-bubble ${isMine ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-white border border-slate-200 text-slate-800 rounded-tl-none'}`}>
-                                                        {m.replyTo && (
-                                                            <div className={`mb-2 p-2 text-[10px] rounded-lg border-l-4 font-bold ${isMine ? 'bg-indigo-700/50 text-indigo-100 border-indigo-300' : 'bg-slate-100 border-indigo-500 text-slate-500'} italic truncate`}>
-                                                                Replied: {m.replyTo.text}
-                                                            </div>
-                                                        )}
+                                                        {m.replyTo && <div className={`mb-2 p-2 text-[10px] rounded-lg border-l-4 font-bold ${isMine ? 'bg-indigo-700/50 text-indigo-100 border-indigo-300' : 'bg-slate-100 border-indigo-500 text-slate-500'} italic truncate`}>Replied: {m.replyTo.text}</div>}
                                                         <div className="break-words font-medium">{m.text}</div>
                                                     </div>
-                                                    {isMine && (
-                                                        <div className="flex items-center gap-1 mt-1.5 px-2">
-                                                            <span className={`text-[9px] font-black uppercase tracking-widest ${m.read ? 'text-indigo-500' : 'text-slate-300'}`}>
-                                                                {m.read ? 'Opened' : 'Sent'}
-                                                            </span>
-                                                            <Icon name={m.read ? "check-check" : "check"} size={10} className={m.read ? "text-indigo-500" : "text-slate-300"} />
-                                                        </div>
-                                                    )}
+                                                    <div className="flex items-center gap-1.5 mt-1.5 px-2">
+                                                        <span className="text-[9px] text-slate-400 font-medium">{formatTime(m.createdAt)}</span>
+                                                        {isMine && (
+                                                            <>
+                                                                <span className={`text-[9px] font-black uppercase tracking-widest ${m.read ? 'text-indigo-500' : 'text-slate-300'}`}>{m.read ? 'Opened' : 'Sent'}</span>
+                                                                <Icon name={m.read ? "check-check" : "check"} size={10} className={m.read ? "text-indigo-500" : "text-slate-300"} />
+                                                            </>
+                                                        )}
+                                                    </div>
                                                 </div>
                                             </div>
                                         );
@@ -501,39 +547,11 @@
                                 </main>
 
                                 <footer className="p-3 md:p-4 border-t bg-white relative pb-safe h-auto shrink-0 z-20">
-                                    {showEmojiPicker && (
-                                        <div className="fixed md:absolute bottom-20 left-2 right-2 md:bottom-full md:left-4 md:right-auto mb-2 bg-white border border-slate-200 p-3 rounded-2xl shadow-2xl z-50 h-64 w-auto md:w-64">
-                                            <div className="grid grid-cols-7 md:grid-cols-6 gap-2 h-full overflow-y-auto emoji-scroll">
-                                                {EMOJI_LIST.map(emoji => (
-                                                    <button key={emoji} onClick={() => addEmoji(emoji)} className="p-1 text-2xl active:scale-90 hover:bg-slate-50 rounded-lg">{emoji}</button>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    )}
-
-                                    {replyingTo && (
-                                        <div className="mb-3 p-3 bg-indigo-50 border-l-4 border-indigo-600 rounded-xl flex items-center justify-between shadow-inner animate-in slide-in-from-bottom-2">
-                                            <div className="flex-1 truncate pr-4 text-[10px] font-bold text-slate-600 tracking-tight">
-                                                <span className="text-indigo-600 font-black uppercase tracking-widest block text-[9px] mb-0.5">Replying to {replyingTo.displayName}</span>
-                                                {replyingTo.text}
-                                            </div>
-                                            <button onClick={() => setReplyingTo(null)} className="text-slate-400 p-2"><Icon name="x" size={16} /></button>
-                                        </div>
-                                    )}
-
+                                    {showEmojiPicker && <div className="fixed md:absolute bottom-20 left-2 right-2 md:bottom-full md:left-4 md:right-auto mb-2 bg-white border border-slate-200 p-3 rounded-2xl shadow-2xl z-50 h-64 w-auto md:w-64 grid grid-cols-7 md:grid-cols-6 gap-2 overflow-y-auto emoji-scroll">{EMOJI_LIST.map(emoji => <button key={emoji} onClick={() => addEmoji(emoji)} className="p-1 text-2xl active:scale-90 hover:bg-slate-50 rounded-lg">{emoji}</button>)}</div>}
+                                    {replyingTo && <div className="mb-3 p-3 bg-indigo-50 border-l-4 border-indigo-600 rounded-xl flex items-center justify-between shadow-inner animate-in slide-in-from-bottom-2"><div className="flex-1 truncate pr-4 text-[10px] font-bold text-slate-600 tracking-tight"><span className="text-indigo-600 font-black uppercase tracking-widest block text-[9px] mb-0.5">Replying to {replyingTo.displayName}</span>{replyingTo.text}</div><button onClick={() => setReplyingTo(null)} className="text-slate-400 p-2"><Icon name="x" size={16} /></button></div>}
                                     <form onSubmit={handleSend} className="flex gap-2 w-full items-center">
                                         <button type="button" onClick={() => setShowEmojiPicker(!showEmojiPicker)} className={`p-3 shrink-0 transition-all ${showEmojiPicker ? 'text-indigo-600 scale-110' : 'text-slate-400'}`}><Icon name="smile" size={24} /></button>
-                                        <input 
-                                            ref={inputRef} 
-                                            value={newMessage} 
-                                            onFocus={() => setShowEmojiPicker(false)} 
-                                            onChange={(e) => { 
-                                                setNewMessage(e.target.value); 
-                                                updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { isTyping: e.target.value.length > 0 }); 
-                                            }} 
-                                            className="flex-1 bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 md:py-4 outline-none focus:ring-4 focus:ring-indigo-500/10 text-base min-w-0 transition-all" 
-                                            placeholder="Message..." 
-                                        />
+                                        <input ref={inputRef} value={newMessage} onFocus={() => setShowEmojiPicker(false)} onChange={(e) => { setNewMessage(e.target.value); updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { isTyping: e.target.value.length > 0 }); }} className="flex-1 bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 md:py-4 outline-none focus:ring-4 focus:ring-indigo-500/10 text-base min-w-0 transition-all" placeholder="Message..." />
                                         <button type="submit" disabled={!newMessage.trim()} className="bg-indigo-600 text-white p-3 md:p-4 rounded-2xl shadow-xl shadow-indigo-100 hover:bg-indigo-700 active:scale-90 disabled:opacity-50 shrink-0 transition-all"><Icon name="send" className="text-white" size={22} /></button>
                                     </form>
                                 </footer>
