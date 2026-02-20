@@ -114,17 +114,25 @@
             const lastSelectedId = React.useRef(null);
             const remoteVideoRef = React.useRef(null);
 
-            const getChatId = (u1, u2) => [u1.toLowerCase(), u2.toLowerCase()].sort().join('_');
+            // Safe Chat ID Generator
+            const getChatId = (u1, u2) => {
+                if (!u1 || !u2) return '';
+                return [u1.toLowerCase(), u2.toLowerCase()].sort().join('_');
+            };
+
             const formatTime = (ts) => {
-                if (!ts) return '';
-                const date = ts.toDate ? ts.toDate() : new Date(ts.seconds * 1000);
-                return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                if (!ts || (!ts.seconds && !ts.toDate)) return '';
+                try {
+                    const date = ts.toDate ? ts.toDate() : new Date(ts.seconds * 1000);
+                    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                } catch (e) { return ''; }
             };
 
             const getStatusText = (targetUser) => {
                 if (!targetUser?.lastSeen) return 'Offline';
                 const lastSeenDate = targetUser.lastSeen.toDate ? targetUser.lastSeen.toDate() : new Date(targetUser.lastSeen.seconds * 1000);
-                const diffInSeconds = (new Date() - lastSeenDate) / 1000;
+                const now = new Date();
+                const diffInSeconds = (now - lastSeenDate) / 1000;
                 return diffInSeconds < 35 ? 'Online' : `Last seen ${formatTime(targetUser.lastSeen)}`;
             };
 
@@ -162,37 +170,56 @@
                 });
             }, []);
 
-            // Presence
+            // Presence (Optimized: only depends on username)
             React.useEffect(() => {
-                if (!profile?.username || !user) return;
-                const updateStatus = () => { if (document.visibilityState === 'visible') updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { lastSeen: serverTimestamp() }).catch(()=>{}); };
+                const username = profile?.username?.toLowerCase();
+                if (!username || !user) return;
+                const updateStatus = () => { if (document.visibilityState === 'visible') updateDoc(doc(db, ...USERS_PATH, username), { lastSeen: serverTimestamp() }).catch(()=>{}); };
                 updateStatus();
                 const intv = setInterval(updateStatus, 15000);
                 return () => clearInterval(intv);
             }, [profile?.username, user]);
 
-            // Sync
+            // User Sync
             React.useEffect(() => {
                 if (!user || (profile?.status !== 'approved' && profile?.role !== 'admin')) return;
-                return onSnapshot(collection(db, ...USERS_PATH), (snapshot) => setAllUsers(snapshot.docs.map(d => ({ id: d.id, ...d.data() }))));
-            }, [user, profile]);
+                return onSnapshot(collection(db, ...USERS_PATH), (snapshot) => {
+                    const users = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                    setAllUsers(users);
+                    // Refresh selected user object to update live status
+                    if (selectedUser) {
+                        const fresh = users.find(u => u.username === selectedUser.username);
+                        if (fresh) setSelectedUser(fresh);
+                    }
+                });
+            }, [user, profile?.status, profile?.role]);
 
+            // Message Sync (Optimized: depends only on current user name)
             React.useEffect(() => {
-                if (!user || !profile?.username) return;
-                return onSnapshot(collection(db, ...MSGS_PATH), (snap) => setGlobalMessages(snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(m => m.chatId?.toLowerCase().includes(profile.username.toLowerCase()))));
-            }, [user, profile]);
+                const myName = profile?.username?.toLowerCase();
+                if (!user || !myName) return;
+                return onSnapshot(collection(db, ...MSGS_PATH), (snap) => {
+                    const msgs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    setGlobalMessages(msgs.filter(m => m.chatId?.toLowerCase().includes(myName)));
+                });
+            }, [user, profile?.username]);
 
+            // Derived Messages
             const currentMessages = React.useMemo(() => {
                 if (!selectedUser || !profile?.username) return [];
                 const chatId = getChatId(profile.username, selectedUser.username);
-                return globalMessages.filter(m => m.chatId === chatId).sort((a,b) => (a.createdAt?.seconds||0) - (b.createdAt?.seconds||0)).slice(-100);
-            }, [globalMessages, selectedUser, profile]);
+                return globalMessages
+                    .filter(m => m.chatId === chatId)
+                    .sort((a,b) => (a.createdAt?.seconds||0) - (b.createdAt?.seconds||0))
+                    .slice(-100);
+            }, [globalMessages, selectedUser?.username, profile?.username]);
 
             const unreadCount = React.useMemo(() => {
                 if (!selectedUser || isAtBottom) return 0;
                 return currentMessages.filter(m => m.senderName === selectedUser.username && !m.read).length;
-            }, [currentMessages, selectedUser, isAtBottom]);
+            }, [currentMessages, selectedUser?.username, isAtBottom]);
 
+            // Scroll Handling
             React.useEffect(() => {
                 if (!selectedUser) { lastSelectedId.current = null; return; }
                 if (lastSelectedId.current !== selectedUser.username) {
@@ -202,14 +229,17 @@
                 } else if (isAtBottom) {
                     scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
                 }
-            }, [currentMessages, selectedUser]);
+            }, [currentMessages, selectedUser?.username]);
 
+            // Read Status Handler
             React.useEffect(() => {
                 if (!user || !selectedUser || currentMessages.length === 0 || !profile?.username) return;
                 if (document.visibilityState === 'visible' && document.hasFocus() && isAtBottom) {
-                    currentMessages.filter(m => m.senderName === selectedUser.username && !m.read).forEach(m => updateDoc(doc(db, ...MSGS_PATH, m.id), { read: true }).catch(()=>{}));
+                    currentMessages.filter(m => m.senderName === selectedUser.username && !m.read).forEach(m => {
+                        updateDoc(doc(db, ...MSGS_PATH, m.id), { read: true }).catch(()=>{});
+                    });
                 }
-            }, [currentMessages, selectedUser, isAtBottom, profile]);
+            }, [currentMessages, selectedUser?.username, isAtBottom, profile?.username]);
 
             const handleSend = async (e) => {
                 if (e) e.preventDefault();
@@ -271,16 +301,18 @@
                 <div className="flex h-screen w-full max-w-6xl mx-auto bg-white relative overflow-hidden md:flex-row border-x border-slate-100">
                     {/* Sidebar */}
                     <div className={`w-full md:w-80 border-r bg-slate-50 flex flex-col shrink-0 h-full ${selectedUser ? 'hidden md:flex' : 'flex'}`}>
-                        <header className="p-5 bg-indigo-900 text-white flex items-center justify-between shrink-0 h-16">
+                        <header className="p-5 bg-indigo-900 text-white flex items-center justify-between shrink-0 h-16 shadow-lg z-20">
                             <div className="flex items-center gap-2"><Icon name="message-square" className="text-indigo-300" /><h2 className="font-bold text-sm tracking-widest uppercase">Secure Vault</h2></div>
                             <button onClick={() => updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { uid: null }).then(() => window.location.reload())}><Icon name="log-out" size={18} /></button>
                         </header>
                         <div className="flex-1 overflow-y-auto hide-scrollbar">
                             <div className="px-3 py-4 text-[10px] font-black uppercase text-slate-400 tracking-widest">Authorized Rooms</div>
                             {allUsers.filter(u => u.status === 'approved' && (profile.role === 'admin' ? u.role !== 'admin' : u.role === 'admin')).map(u => {
+                                if (!profile?.username) return null;
                                 const chatId = getChatId(profile.username, u.username);
-                                const lastM = globalMessages.filter(m => m.chatId === chatId).sort((a,b) => (b.createdAt?.seconds||0) - (a.createdAt?.seconds||0))[0];
-                                const unread = globalMessages.filter(m => m.chatId === chatId && m.senderName === u.username && !m.read).length;
+                                const chatHistory = globalMessages.filter(m => m.chatId === chatId);
+                                const lastM = chatHistory.sort((a,b) => (b.createdAt?.seconds||0) - (a.createdAt?.seconds||0))[0];
+                                const unread = chatHistory.filter(m => m.senderName === u.username && !m.read).length;
                                 return (
                                     <button key={u.id} onClick={() => setSelectedUser(u)} className={`w-full text-left p-4 transition-all flex items-center gap-3 border-b ${selectedUser?.username === u.username ? 'bg-indigo-600 text-white shadow-xl' : 'bg-white hover:bg-slate-50'}`}>
                                         <div className="relative shrink-0">
@@ -332,14 +364,14 @@
                                     </div>
                                 </header>
 
-                                <main onScroll={handleScroll} className="flex-1 overflow-y-auto p-4 space-y-5 bg-slate-50/30 hide-scrollbar relative">
+                                <main onScroll={(e) => setIsAtBottom(e.target.scrollHeight - e.target.scrollTop - e.target.clientHeight < 100)} className="flex-1 overflow-y-auto p-4 space-y-5 bg-slate-50/30 hide-scrollbar relative">
                                     {currentMessages.map(m => {
                                         const isMine = m.senderName === profile.username;
                                         return (
                                             <div key={m.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'} group items-center gap-2 message-group`}>
                                                 <button onClick={() => setReplyingTo(m)} className={`reply-button p-2 text-slate-400 bg-white border border-slate-100 rounded-full shadow-sm shrink-0 active:scale-90 ${isMine ? 'order-first' : 'order-last'}`}><Icon name="corner-up-left" size={12} /></button>
                                                 <div className={`flex flex-col min-w-0 ${isMine ? 'items-end' : 'items-start'} max-w-[85%] md:max-w-[75%]`}>
-                                                    <div className={`p-4 rounded-2xl text-[14px] leading-relaxed shadow-sm relative msg-bubble ${isMine ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-white border text-slate-800 rounded-tl-none'}`}>
+                                                    <div className={`p-4 rounded-2xl text-[14px] shadow-sm relative msg-bubble ${isMine ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-white border text-slate-800 rounded-tl-none'}`}>
                                                         {m.replyTo && <div className={`mb-2 p-2 text-[10px] rounded-lg border-l-4 font-bold ${isMine ? 'bg-indigo-700/50 border-indigo-300' : 'bg-slate-100 border-indigo-500 text-slate-500'} italic truncate`}>Replied: {m.replyTo.text}</div>}
                                                         <div className="break-words">{m.text}</div>
                                                     </div>
@@ -366,14 +398,14 @@
                                     <form onSubmit={handleSend} className="flex gap-2 w-full items-end">
                                         <button type="button" className="p-3 shrink-0 text-slate-400"><Icon name="smile" size={24} /></button>
                                         <textarea ref={inputRef} value={newMessage} onKeyDown={(e) => { if(e.key==='Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }} onChange={(e) => { setNewMessage(e.target.value); e.target.style.height = 'auto'; e.target.style.height = `${e.target.scrollHeight}px`; updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { isTyping: e.target.value.length > 0 }); }} className="flex-1 bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 outline-none focus:ring-4 focus:ring-indigo-500/10 text-base min-w-0 chat-input overflow-y-auto hide-scrollbar" placeholder="Message..." rows="1" />
-                                        <button type="submit" disabled={!newMessage.trim()} className="bg-indigo-600 text-white p-3 md:p-4 rounded-2xl shadow-xl hover:bg-indigo-700 active:scale-90 transition-all mb-1"><Icon name="send" size={20} /></button>
+                                        <button type="submit" disabled={!newMessage.trim()} className="bg-indigo-600 text-white p-3 md:p-4 rounded-2xl shadow-xl hover:bg-indigo-700 active:scale-90 disabled:opacity-50 shrink-0 transition-all mb-1"><Icon name="send" size={20} /></button>
                                     </form>
                                 </footer>
                             </>
                         ) : (
                             <div className="flex-1 flex flex-col items-center justify-center text-slate-300 p-8 text-center uppercase tracking-[0.25em] font-black">
                                 <div className="bg-slate-50 p-10 rounded-[3rem] border border-slate-100 mb-8"><Icon name="message-square" size={64} className="opacity-10" /></div>
-                                <p className="text-[10px]">Secure Vault connection established</p>
+                                <p className="text-[10px]">Secure Vault established</p>
                             </div>
                         )}
                     </div>
