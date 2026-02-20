@@ -144,7 +144,10 @@
             // --- AUTO FOCUS ON REPLY ---
             React.useEffect(() => {
                 if (replyingTo && inputRef.current) {
-                    inputRef.current.focus();
+                    // Small timeout ensures the focus works on mobile browsers after layout shifts
+                    setTimeout(() => {
+                        inputRef.current?.focus();
+                    }, 100);
                 }
             }, [replyingTo]);
 
@@ -206,13 +209,27 @@
                 });
             }, [user, profile, selectedUser?.username]);
 
-            // 4. Read Status Updates
+            // 4. Read Status Updates (IMPROVED: Only if tab is focused)
             React.useEffect(() => {
                 if (!user || !selectedUser || messages.length === 0 || !profile?.username) return;
-                const unread = messages.filter(m => m.senderName === selectedUser.username && !m.read);
-                unread.forEach(async (m) => {
-                    try { await updateDoc(doc(db, ...MSGS_PATH, m.id), { read: true }); } catch (e) {}
-                });
+                
+                const markAsRead = async () => {
+                    // Only mark as read if the user is actually viewing the tab
+                    if (document.visibilityState === 'visible' && document.hasFocus()) {
+                        const unread = messages.filter(m => m.senderName === selectedUser.username && !m.read);
+                        unread.forEach(async (m) => {
+                            try { await updateDoc(doc(db, ...MSGS_PATH, m.id), { read: true }); } catch (e) {}
+                        });
+                    }
+                };
+
+                markAsRead();
+                window.addEventListener('focus', markAsRead);
+                document.addEventListener('visibilitychange', markAsRead);
+                return () => {
+                    window.removeEventListener('focus', markAsRead);
+                    document.removeEventListener('visibilitychange', markAsRead);
+                };
             }, [messages, selectedUser, profile]);
 
             // 5. Scroll Logic
@@ -331,6 +348,11 @@
                 } catch (e) { setNewMessage(text); }
             };
 
+            const addEmoji = (emoji) => {
+                setNewMessage(prev => prev + emoji);
+                if (inputRef.current) inputRef.current.focus();
+            };
+
             if (loading) return <div className="h-screen flex items-center justify-center text-indigo-600"><div className="animate-spin h-8 w-8 border-4 border-indigo-600 border-t-transparent rounded-full"></div></div>;
 
             if (!user || profile?.status === 'new') return (
@@ -348,7 +370,7 @@
                 </div>
             );
 
-            if (profile?.status === 'pending') return <div className="h-full flex items-center justify-center p-4 text-center"><div className="max-w-xs"><Icon name="clock" size={48} className="mx-auto mb-4 text-amber-500 animate-pulse" /><h2 className="text-xl font-bold">Access Pending</h2><p className="text-slate-500 text-sm mt-2 font-medium">Wait for admin to verify @{profile.username}.</p><button onClick={() => updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { uid: null })} className="mt-6 text-xs font-black uppercase text-indigo-600">Switch User</button></div></div>;
+            if (profile?.status === 'pending') return <div className="h-full flex items-center justify-center p-4 text-center"><div className="max-w-xs"><Icon name="clock" size={48} className="mx-auto mb-4 text-amber-500 animate-pulse" /><h2 className="text-xl font-bold">Access Pending</h2><p className="text-slate-500 text-sm mt-2">Wait for admin to verify @{profile.username}.</p><button onClick={() => updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { uid: null })} className="mt-6 text-xs font-black uppercase text-indigo-600">Switch User</button></div></div>;
 
             return (
                 <div className="flex h-full w-full max-w-6xl mx-auto bg-white relative overflow-hidden md:flex-row border-x border-slate-100">
@@ -431,7 +453,7 @@
                                 <header className="p-3 md:p-4 border-b flex justify-between items-center bg-white shrink-0 h-16 z-10">
                                     <div className="flex items-center gap-2 min-w-0">
                                         <button onClick={() => setSelectedUser(null)} className="md:hidden p-2"><Icon name="chevron-left" size={24} /></button>
-                                        <div className="w-9 h-9 md:w-10 md:h-10 rounded-full bg-slate-50 border flex items-center justify-center font-bold uppercase shrink-0 text-indigo-600">{selectedUser.username[0]}</div>
+                                        <div className="w-9 h-9 md:w-10 md:h-10 rounded-full bg-slate-50 border flex items-center justify-center font-bold uppercase shrink-0 text-indigo-600">{(selectedUser.username || 'U')[0]}</div>
                                         <div className="flex flex-col min-w-0"><h2 className="font-bold uppercase text-sm tracking-tighter truncate">@{selectedUser.username}</h2><div className="flex items-center gap-1"><div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></div><span className="text-[9px] font-bold text-indigo-600 uppercase tracking-widest">Secure</span></div></div>
                                     </div>
                                     <div className="flex gap-1">
@@ -441,33 +463,77 @@
                                 </header>
 
                                 <main className="flex-1 overflow-y-auto p-4 space-y-5 bg-slate-50/30 hide-scrollbar relative">
-                                    {messages.map(m => (
-                                        <div key={m.id} className={`flex ${m.senderName === profile.username ? 'justify-end' : 'justify-start'} group items-center gap-2 max-w-full message-group`}>
-                                            <button onClick={() => setReplyingTo(m)} className="reply-button p-2 text-slate-400 bg-white border border-slate-100 rounded-full order-last shadow-sm shrink-0 active:scale-90"><Icon name="corner-up-left" size={12} /></button>
-                                            <div className={`flex flex-col min-w-0 ${m.senderName === profile.username ? 'items-end' : 'items-start'} max-w-[85%] md:max-w-[75%]`}>
-                                                <div className={`p-4 rounded-2xl text-[14px] leading-relaxed shadow-sm relative msg-bubble ${m.senderName === profile.username ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-white border border-slate-200 text-slate-800 rounded-tl-none'}`}>
-                                                    {m.replyTo && <div className={`mb-2 p-2 text-[10px] rounded-lg border-l-4 font-bold ${m.senderName === profile.username ? 'bg-indigo-700/50 text-indigo-100 border-indigo-300' : 'bg-slate-100 border-indigo-500 text-slate-500'} italic truncate`}>Replied: {m.replyTo.text}</div>}
-                                                    <div className="break-words font-medium">{m.text}</div>
-                                                </div>
-                                                {m.senderName === profile.username && (
-                                                    <div className="flex items-center gap-1 mt-1.5 px-2">
-                                                        <span className={`text-[9px] font-black uppercase tracking-widest ${m.read ? 'text-indigo-500' : 'text-slate-300'}`}>{m.read ? 'Opened' : 'Sent'}</span>
-                                                        <Icon name={m.read ? "check-check" : "check"} size={10} className={m.read ? "text-indigo-500" : "text-slate-300"} />
+                                    {messages.map(m => {
+                                        const isMine = m.senderName === profile.username;
+                                        return (
+                                            <div key={m.id} className={`flex ${isMine ? 'justify-end' : 'justify-start'} group items-center gap-2 max-w-full message-group`}>
+                                                {/* Reply button positioned correctly for sender and receiver */}
+                                                <button 
+                                                    onClick={() => setReplyingTo(m)} 
+                                                    className={`reply-button p-2 text-slate-400 bg-white border border-slate-100 rounded-full shadow-sm shrink-0 active:scale-90 ${isMine ? 'order-first' : 'order-last'}`}
+                                                >
+                                                    <Icon name="corner-up-left" size={12} />
+                                                </button>
+                                                
+                                                <div className={`flex flex-col min-w-0 ${isMine ? 'items-end' : 'items-start'} max-w-[85%] md:max-w-[75%]`}>
+                                                    <div className={`p-4 rounded-2xl text-[14px] leading-relaxed shadow-sm relative msg-bubble ${isMine ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-white border border-slate-200 text-slate-800 rounded-tl-none'}`}>
+                                                        {m.replyTo && (
+                                                            <div className={`mb-2 p-2 text-[10px] rounded-lg border-l-4 font-bold ${isMine ? 'bg-indigo-700/50 text-indigo-100 border-indigo-300' : 'bg-slate-100 border-indigo-500 text-slate-500'} italic truncate`}>
+                                                                Replied: {m.replyTo.text}
+                                                            </div>
+                                                        )}
+                                                        <div className="break-words font-medium">{m.text}</div>
                                                     </div>
-                                                )}
+                                                    {isMine && (
+                                                        <div className="flex items-center gap-1 mt-1.5 px-2">
+                                                            <span className={`text-[9px] font-black uppercase tracking-widest ${m.read ? 'text-indigo-500' : 'text-slate-300'}`}>
+                                                                {m.read ? 'Opened' : 'Sent'}
+                                                            </span>
+                                                            <Icon name={m.read ? "check-check" : "check"} size={10} className={m.read ? "text-indigo-500" : "text-slate-300"} />
+                                                        </div>
+                                                    )}
+                                                </div>
                                             </div>
-                                        </div>
-                                    ))}
+                                        );
+                                    })}
                                     {selectedUser.isTyping && <div className="flex justify-start"><div className="bg-white border p-3 rounded-2xl rounded-tl-none flex items-center gap-2 text-slate-400 text-xs font-bold uppercase italic shadow-sm tracking-tighter">typing <div className="flex gap-0.5"><span className="typing-dot"></span><span className="typing-dot"></span><span className="typing-dot"></span></div></div></div>}
                                     <div ref={scrollRef} className="h-4" />
                                 </main>
 
                                 <footer className="p-3 md:p-4 border-t bg-white relative pb-safe h-auto shrink-0 z-20">
-                                    {showEmojiPicker && <div className="fixed md:absolute bottom-20 left-2 right-2 md:bottom-full md:left-4 md:right-auto mb-2 bg-white border border-slate-200 p-3 rounded-2xl shadow-2xl z-50 h-64 w-auto md:w-64 grid grid-cols-7 md:grid-cols-6 gap-2 overflow-y-auto emoji-scroll">{EMOJI_LIST.map(emoji => <button key={emoji} onClick={() => addEmoji(emoji)} className="p-1 text-2xl active:scale-90 hover:bg-slate-50 rounded-lg">{emoji}</button>)}</div>}
-                                    {replyingTo && <div className="mb-3 p-3 bg-indigo-50 border-l-4 border-indigo-600 rounded-xl flex items-center justify-between shadow-inner animate-in slide-in-from-bottom-2"><div className="flex-1 truncate pr-4 text-[10px] font-bold text-slate-600 tracking-tight"><span className="text-indigo-600 font-black uppercase tracking-widest block text-[9px] mb-0.5">Replying to {replyingTo.displayName}</span>{replyingTo.text}</div><button onClick={() => setReplyingTo(null)} className="text-slate-400 p-2"><Icon name="x" size={16} /></button></div>}
+                                    {showEmojiPicker && (
+                                        <div className="fixed md:absolute bottom-20 left-2 right-2 md:bottom-full md:left-4 md:right-auto mb-2 bg-white border border-slate-200 p-3 rounded-2xl shadow-2xl z-50 h-64 w-auto md:w-64">
+                                            <div className="grid grid-cols-7 md:grid-cols-6 gap-2 h-full overflow-y-auto emoji-scroll">
+                                                {EMOJI_LIST.map(emoji => (
+                                                    <button key={emoji} onClick={() => addEmoji(emoji)} className="p-1 text-2xl active:scale-90 hover:bg-slate-50 rounded-lg">{emoji}</button>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {replyingTo && (
+                                        <div className="mb-3 p-3 bg-indigo-50 border-l-4 border-indigo-600 rounded-xl flex items-center justify-between shadow-inner animate-in slide-in-from-bottom-2">
+                                            <div className="flex-1 truncate pr-4 text-[10px] font-bold text-slate-600 tracking-tight">
+                                                <span className="text-indigo-600 font-black uppercase tracking-widest block text-[9px] mb-0.5">Replying to {replyingTo.displayName}</span>
+                                                {replyingTo.text}
+                                            </div>
+                                            <button onClick={() => setReplyingTo(null)} className="text-slate-400 p-2"><Icon name="x" size={16} /></button>
+                                        </div>
+                                    )}
+
                                     <form onSubmit={handleSend} className="flex gap-2 w-full items-center">
                                         <button type="button" onClick={() => setShowEmojiPicker(!showEmojiPicker)} className={`p-3 shrink-0 transition-all ${showEmojiPicker ? 'text-indigo-600 scale-110' : 'text-slate-400'}`}><Icon name="smile" size={24} /></button>
-                                        <input ref={inputRef} value={newMessage} onFocus={() => setShowEmojiPicker(false)} onChange={(e) => { setNewMessage(e.target.value); updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { isTyping: e.target.value.length > 0 }); }} className="flex-1 bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 md:py-4 outline-none focus:ring-4 focus:ring-indigo-500/10 text-base min-w-0 transition-all" placeholder="Message..." />
+                                        <input 
+                                            ref={inputRef} 
+                                            value={newMessage} 
+                                            onFocus={() => setShowEmojiPicker(false)} 
+                                            onChange={(e) => { 
+                                                setNewMessage(e.target.value); 
+                                                updateDoc(doc(db, ...USERS_PATH, profile.username.toLowerCase()), { isTyping: e.target.value.length > 0 }); 
+                                            }} 
+                                            className="flex-1 bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 md:py-4 outline-none focus:ring-4 focus:ring-indigo-500/10 text-base min-w-0 transition-all" 
+                                            placeholder="Message..." 
+                                        />
                                         <button type="submit" disabled={!newMessage.trim()} className="bg-indigo-600 text-white p-3 md:p-4 rounded-2xl shadow-xl shadow-indigo-100 hover:bg-indigo-700 active:scale-90 disabled:opacity-50 shrink-0 transition-all"><Icon name="send" className="text-white" size={22} /></button>
                                     </form>
                                 </footer>
